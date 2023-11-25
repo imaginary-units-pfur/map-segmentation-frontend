@@ -13,6 +13,9 @@ js-sys = "0.3.65"
 log = "0.4.20"
 reqwest = { version = "0.11.22", features = ["json", "multipart"] }
 serde = { version = "1.0.193", features = ["serde_derive"] }
+shadow-clone = "1.2.1"
 wasm-logger = "0.2.0"
 web-sys = { version = "0.3.65", features = ["DataTransfer", "DragEvent"] }
 yew = { version = "0.21.0", features = ["csr"] }
+yew-autoprops = "0.3.0"
+yew-hooks = "0.3.0"

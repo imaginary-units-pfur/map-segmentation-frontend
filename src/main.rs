@@ -3,12 +3,17 @@ use base64::Engine;
 use gloo::file::callbacks::FileReader;
 use gloo::file::File;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use shadow_clone::shadow_clone;
+use std::{borrow::Borrow, collections::HashMap, rc::Rc, sync::Arc};
 use web_sys::{Event, FileList, HtmlInputElement};
-use yew::html::TargetCast;
-use yew::{html, Component, Context, Html};
+use yew::{
+    prelude::*,
+    suspense::{use_future, use_future_with},
+};
+use yew_autoprops::autoprops_component;
+use yew_hooks::prelude::*;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Clone)]
 struct FileDetails {
     file_name: String,
     file_type: String,
@@ -23,187 +28,210 @@ where
     Deserialize::deserialize(d).map(|v: String| STANDARD.decode(v.into_bytes()).unwrap())
 }
 
-struct App {
-    server_url: String,
-    readers: HashMap<String, FileReader>,
-    satellite_image: Option<FileDetails>,
-    mask_image: Option<FileDetails>,
+#[function_component(App)]
+fn app() -> Html {
+    let src_image_state = use_state(|| Rc::new(None));
+
+    let onupload = {
+        shadow_clone!(src_image_state);
+        move |newdata| {
+            src_image_state.set(newdata);
+        }
+    };
+
+    html! {
+        <div class="row justify-content-evenly">
+            <div class="col-4">
+                <h1>{"Satellite image"}</h1>
+                <UploadPane {onupload} />
+            </div>
+            <div class="col-4">
+                <h1>{"Segments"}</h1>
+                <SegmentsPane image_data={(*src_image_state).clone()} />
+            </div>
+        </div>
+    }
 }
 
-enum Msg {
-    AddNewImage(Vec<File>),
-    FinishRead(String, String, Vec<u8>),
-    FinishSend(Result<FileDetails, String>),
+#[autoprops_component(SegmentsPane)]
+fn segments_pane(image_data: Rc<Option<FileDetails>>) -> Html {
+    let mask_image: UseStateHandle<Rc<Option<FileDetails>>> = use_state(|| Rc::new(None));
+
+    let fallback = html!(
+        <h1>{"Processing image..."} <span class="spinner-border text-success"></span></h1>
+    );
+
+    html!(
+        <Suspense {fallback}>
+            <SegmentsInnerPane src_image={image_data} />
+        </Suspense>
+    )
 }
 
-impl Component for App {
-    type Message = Msg;
+#[derive(Properties, PartialEq)]
+struct SegmentsInnerPaneProps {
+    src_image: Rc<Option<FileDetails>>,
+}
 
-    type Properties = ();
-
-    fn create(_ctx: &Context<Self>) -> Self {
-        let server_url = std::option_env!("SERVER_URL")
-            .expect("No server url provided. Please set `SERVER_URL` environment variable.");
-        Self {
-            server_url: server_url.to_string(),
-            readers: HashMap::default(),
-            satellite_image: None,
-            mask_image: None,
+#[function_component(SegmentsInnerPane)]
+fn segments_inner_pane(props: &SegmentsInnerPaneProps) -> HtmlResult {
+    let res = use_future_with(props.src_image.clone(), |deps| async move {
+        if deps.is_none() {
+            return None;
         }
-    }
+        let FileDetails {
+            file_name,
+            file_type,
+            data,
+        } = (**deps).clone().unwrap();
+        let client = reqwest::Client::new();
+        let body = reqwest::multipart::Form::new().part(
+            "f[]",
+            reqwest::multipart::Part::bytes(data)
+                .file_name(file_name)
+                .mime_str(&file_type)
+                .unwrap(),
+        );
+        let reqwest = client
+            .post(format!("{}/segment", env!("SERVER_URL")))
+            .multipart(body)
+            .send()
+            .await;
+        let result = match reqwest {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(mask) => match mask.json::<FileDetails>().await {
+                    Ok(json) => Ok(json),
+                    Err(e) => Err(format!("Error in receiving json: {e}")),
+                },
+                Err(e) => Err(format!("Error code in sending imaget to server: {e}")),
+            },
+            Err(e) => Err(format!("Error sending image to server: {e}")),
+        };
 
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        match msg {
-            Msg::AddNewImage(files) => {
-                self.satellite_image = None;
-                self.mask_image = None;
-                log::info!("New image: {files:?}");
-                for file in files.into_iter() {
-                    let file_name = file.name();
-                    let file_type = file.raw_mime_type();
+        Some(result)
+    })?;
 
-                    let task = {
-                        let link = ctx.link().clone();
-                        let file_name = file_name.clone();
-
-                        gloo::file::callbacks::read_as_bytes(&file, move |res| {
-                            link.send_message(Msg::FinishRead(
-                                file_name,
-                                file_type,
-                                res.expect("Failed to read file."),
-                            ))
-                        })
-                    };
-                    self.readers.insert(file_name, task);
-                }
-                true
-            }
-            Msg::FinishRead(file_name, file_type, data) => {
-                log::info!("Finished reading {file_name}");
-                self.readers.remove(&file_name);
-                self.satellite_image = Some(FileDetails {
-                    file_name: file_name.clone(),
-                    file_type: file_type.clone(),
-                    data: data.clone(),
-                });
-                let server_url = self.server_url.clone();
-                ctx.link().send_future(async move {
-                    let client = reqwest::Client::new();
-                    let body = reqwest::multipart::Form::new().part(
-                        "f[]",
-                        reqwest::multipart::Part::bytes(data)
-                            .file_name(file_name)
-                            .mime_str(&file_type)
-                            .unwrap(),
-                    );
-                    let reqwest = client
-                        .post(format!("{}/segment", server_url))
-                        .multipart(body)
-                        .send()
-                        .await;
-                    let result = match reqwest {
-                        Ok(resp) => match resp.error_for_status() {
-                            Ok(mask) => match mask.json::<FileDetails>().await {
-                                Ok(json) => Ok(json),
-                                Err(e) => Err(format!("Error in receiving json: {e}")),
-                            },
-                            Err(e) => Err(format!("Error code in sending imaget to server: {e}")),
-                        },
-                        Err(e) => Err(format!("Error sending image to server: {e}")),
-                    };
-                    Msg::FinishSend(result)
-                });
-                true
-            }
-            Msg::FinishSend(resp) => {
-                match resp {
-                    Ok(mask) => self.mask_image = Some(mask),
-                    Err(e) => log::error!("{}", e),
-                };
-                true
-            }
-        }
-    }
-
-    fn view(&self, ctx: &Context<Self>) -> Html {
-        html! {
-            <div class="row justify-content-evenly">
-                <div class="col-4">
-                    <h1>{"Satellite image"}</h1>
-                    {
-                        if let Some(file) = &self.satellite_image {
-                            html! {
-                                <div>
-                                    <h2>{&file.file_name}</h2>
-                                    <img
-                                        width={"100%"}
-                                        src={
-                                            format!("data:{};base64,{}",
-                                            file.file_type,
-                                            STANDARD.encode(&file.data))
-                                        }
-                                    />
-                                </div>
-                            }
-                        } else {
-                            html! {
-                                <p>{"No file uploaded."}</p>
-                            }
+    let answer = match *res {
+        Some(ref res) => match res {
+            Ok(file) => html! {
+                <div>
+                    <h2>{&file.file_name}</h2>
+                    <img
+                        width={"100%"}
+                        src={
+                            format!("data:{};base64,{}",
+                            file.file_type,
+                            STANDARD.encode(&file.data))
                         }
-                    }
-                    <input
-                        type="file"
-                        accept="image/*"
-                        multiple={false}
-                        onchange={ctx.link().callback(move |e: Event| {
-                            let input: HtmlInputElement = e.target_unchecked_into();
-                            Self::upload_files(input.files())
-                        })}
                     />
                 </div>
-                <div class="col-4">
-                    <h1>{"Segments"}</h1>
-                    {
-                        if let Some(file) = &self.mask_image {
-                            html! {
-                                <div>
-                                    <h2>{&file.file_name}</h2>
-                                    <img
-                                        width={"100%"}
-                                        src={
-                                            format!("data:{};base64,{}",
-                                            file.file_type,
-                                            STANDARD.encode(&file.data))
-                                        }
-                                    />
-                                </div>
-                            }
-                        } else {
-                            html! {
-                                <p>{"No mask image."}</p>
-                            }
-                        }
-                    }
+            },
+            Err(why) => html!(
+                <div class="alert alert-danger">
+                    {"Could not fetch answer: "}{why}
                 </div>
-            </div>
-        }
-    }
+            ),
+        },
+        None => html!({ "No image uploaded yet..." }),
+    };
+
+    Ok(answer)
 }
 
-impl App {
-    fn upload_files(files: Option<FileList>) -> Msg {
-        log::info!("Uploading new image");
-        let mut to_upload = vec![];
-        if let Some(files) = files {
+#[autoprops_component(UploadPane)]
+fn upload_pane(#[prop_or_default] onupload: Callback<Rc<Option<FileDetails>>>) -> Html {
+    let src_image_state = use_state(|| Rc::new(None));
+    let readers = use_map(HashMap::new());
+
+    let on_complete_read = {
+        shadow_clone!(src_image_state, readers, onupload);
+        move |file_name, file_type, data| {
+            readers.remove(&file_name);
+
+            log::info!("Finished reading {file_name}");
+            let src_img = Rc::new(Some(FileDetails {
+                file_name,
+                file_type,
+                data,
+            }));
+
+            src_image_state.set(src_img.clone());
+
+            onupload.emit(src_img);
+        }
+    };
+
+    let onupload = {
+        shadow_clone!(src_image_state, readers);
+        move |e: Event| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            let files = input.files();
+            let files = match files {
+                Some(f) => f,
+                None => return,
+            };
             let files = js_sys::try_iter(&files)
                 .unwrap()
                 .unwrap()
                 .map(|v| web_sys::File::from(v.unwrap()))
-                .map(File::from);
-            to_upload.extend(files);
+                .map(File::from)
+                .collect::<Vec<_>>();
+
+            log::info!("New image: {files:?}");
+            for file in files.into_iter() {
+                let file_name = file.name();
+                let file_type = file.raw_mime_type();
+
+                let task = {
+                    let file_name = file_name.clone();
+
+                    gloo::file::callbacks::read_as_bytes(&file, {
+                        shadow_clone!(on_complete_read);
+                        move |res| {
+                            on_complete_read(
+                                file_name,
+                                file_type,
+                                res.expect("Failed to read file."),
+                            )
+                        }
+                    })
+                };
+                readers.insert(file_name, task);
+            }
         }
-        Msg::AddNewImage(to_upload)
-    }
+    };
+
+    html!(
+        <>
+        {
+            if let Some(file) = (*src_image_state).borrow() {
+                html! {
+                    <div>
+                        <h2>{&file.file_name}</h2>
+                        <img
+                            width={"100%"}
+                            src={
+                                format!("data:{};base64,{}",
+                                file.file_type,
+                                STANDARD.encode(&file.data))
+                            }
+                        />
+                    </div>
+                }
+            } else {
+                html! {
+                    <p>{"No file uploaded."}</p>
+                }
+            }
+        }
+        <input
+            type="file"
+            accept="image/*"
+            multiple={false}
+            onchange={onupload}
+        />
+        </>
+    )
 }
 
 fn main() {
